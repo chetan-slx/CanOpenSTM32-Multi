@@ -393,3 +393,7 @@ Project outputs*
 History/
 *.SchDocPreview
 *.$$$Preview
+
+# Object Dictionary
+OD.c
+OD.h
