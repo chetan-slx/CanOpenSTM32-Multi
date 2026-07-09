@@ -31,12 +31,59 @@
 #include "301/CO_driver.h"
 #include "CO_app_STM32.h"
 
-/* Local CAN module object */
-static CO_CANmodule_t* CANModule_local = NULL; /* Local instance of global CAN module */
-
 /* CAN masks for identifiers */
 #define CANID_MASK 0x07FF /*!< CAN standard ID mask */
 #define FLAG_RTR   0x8000 /*!< RTR flag, part of identifier */
+
+/*******************************************************************************
+ * Multi-instance ISR dispatch table
+ * Up to CO_STM32_MAX_CAN_INSTANCES independent CAN buses supported.
+ ******************************************************************************/
+#define CO_STM32_MAX_CAN_INSTANCES 2U
+
+static CO_CANmodule_t* CANModule_instances[CO_STM32_MAX_CAN_INSTANCES];
+static uint8_t         CANModule_instance_count = 0U;
+
+/**
+ * Find a registered CANmodule by its HAL handle pointer.
+ * Called from ISR context - must be O(n) but n <= 2 so it is deterministic.
+ */
+static CO_CANmodule_t*
+prv_find_canmodule_by_handle(void* hal_handle) {
+    for (uint8_t i = 0U; i < CANModule_instance_count; i++) {
+        if (CANModule_instances[i] != NULL
+            && ((CANopenNodeSTM32*)CANModule_instances[i]->CANptr)->CANHandle == hal_handle) {
+            return CANModule_instances[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * Register a CANmodule instance.
+ * If the same HAL handle is registered again (CO_RESET_COMM path), the existing
+ * slot is updated in-place instead of adding a new entry.
+ */
+static CO_ReturnError_t
+prv_register_canmodule(CO_CANmodule_t* CANmodule) {
+    void* handle = ((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle;
+
+    /* Update existing slot for the same handle (reset path) */
+    for (uint8_t i = 0U; i < CANModule_instance_count; i++) {
+        if (CANModule_instances[i] != NULL
+            && ((CANopenNodeSTM32*)CANModule_instances[i]->CANptr)->CANHandle == handle) {
+            CANModule_instances[i] = CANmodule;
+            return CO_ERROR_NO;
+        }
+    }
+
+    /* New handle - add to next free slot */
+    if (CANModule_instance_count >= CO_STM32_MAX_CAN_INSTANCES) {
+        return CO_ERROR_OUT_OF_MEMORY; /* Increase CO_STM32_MAX_CAN_INSTANCES */
+    }
+    CANModule_instances[CANModule_instance_count++] = CANmodule;
+    return CO_ERROR_NO;
+}
 
 /******************************************************************************/
 void
@@ -80,8 +127,12 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
     /* Hold CANModule variable */
     CANmodule->CANptr = CANptr;
 
-    /* Keep a local copy of CANModule */
-    CANModule_local = CANmodule;
+    /* Register this instance in the dispatch table.
+     * On CO_RESET_COMM the same handle will be re-registered (slot update). */
+    CO_ReturnError_t regErr = prv_register_canmodule(CANmodule);
+    if (regErr != CO_ERROR_NO) {
+        return regErr;
+    }
 
     /* Configure object variables */
     CANmodule->rxArray = rxArray;
@@ -247,6 +298,9 @@ CO_CANtxBufferInit(CO_CANmodule_t* CANmodule, uint16_t index, uint16_t ident, bo
  *
  * \param[in]       CANmodule: CAN module instance
  * \param[in]       buffer: Pointer to buffer to transmit
+ *
+ * NOTE: tx_hdr is now a local (stack) variable.  Previously 'static' caused
+ * data corruption when two instances call this from different ISR priorities.
  */
 static uint8_t
 prv_send_can_message(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
@@ -255,7 +309,7 @@ prv_send_can_message(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
 
     /* Check if TX FIFO is ready to accept more messages */
 #ifdef CO_STM32_FDCAN_Driver
-    static FDCAN_TxHeaderTypeDef tx_hdr;
+    FDCAN_TxHeaderTypeDef tx_hdr;  /* NOT static - per-call local */
     if (HAL_FDCAN_GetTxFifoFreeLevel(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle) > 0) {
         /*
          * RTR flag is part of identifier value
@@ -308,7 +362,7 @@ prv_send_can_message(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
             == HAL_OK;
     }
 #else
-    static CAN_TxHeaderTypeDef tx_hdr;
+    CAN_TxHeaderTypeDef tx_hdr;  /* NOT static - per-call local */
     /* Check if TX FIFO is ready to accept more messages */
     if (HAL_CAN_GetTxMailboxesFreeLevel(((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle) > 0) {
         /*
@@ -397,11 +451,6 @@ CO_CANclearPendingSyncPDOs(CO_CANmodule_t* CANmodule) {
     }
 }
 
-/******************************************************************************/
-/* Get error counters from the module. If necessary, function may use
-    * different way to determine errors. */
-static uint16_t rxErrors = 0, txErrors = 0, overflow = 0;
-
 void
 CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
     uint32_t err = 0;
@@ -479,11 +528,15 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 }
 
 /**
- * \brief           Read message from RX FIFO
+ * \brief           Read a message from the RX FIFO and dispatch it to the matching CANrx slot.
  * \param           hfdcan: pointer to an FDCAN_HandleTypeDef structure that contains
  *                      the configuration information for the specified FDCAN.
  * \param[in]       fifo: Fifo number to use for read
  * \param[in]       fifo_isrs: List of interrupts for respected FIFO
+ *
+ * NOTE: rx_hdr is now a local (stack) variable.  Previously 'static' caused
+ * data corruption when two CAN ISRs at different NVIC priorities interrupted
+ * each other before the header was consumed.
  */
 #ifdef CO_STM32_FDCAN_Driver
 static void
@@ -493,6 +546,15 @@ static void
 prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_isrs)
 #endif
 {
+    /* Resolve which CANmodule owns this hardware handle */
+#ifdef CO_STM32_FDCAN_Driver
+    CO_CANmodule_t* CANModule_local = prv_find_canmodule_by_handle(hfdcan);
+#else
+    CO_CANmodule_t* CANModule_local = prv_find_canmodule_by_handle(hcan);
+#endif
+    if (CANModule_local == NULL) {
+        return; /* ISR fired for an unregistered handle - ignore */
+    }
 
     CO_CANrxMsg_t rcvMsg;
     CO_CANrx_t* buffer = NULL; /* receive message buffer from CO_CANmodule_t object. */
@@ -501,7 +563,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     uint8_t messageFound = 0;
 
 #ifdef CO_STM32_FDCAN_Driver
-    static FDCAN_RxHeaderTypeDef rx_hdr;
+    FDCAN_RxHeaderTypeDef rx_hdr;  /* NOT static - per-call local */
     /* Read received message from FIFO */
     if (HAL_FDCAN_GetRxMessage(hfdcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
         return;
@@ -542,7 +604,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     }
     rcvMsgIdent = rcvMsg.ident;
 #else
-    static CAN_RxHeaderTypeDef rx_hdr;
+    CAN_RxHeaderTypeDef rx_hdr;  /* NOT static - per-call local */
     /* Read received message from FIFO */
     if (HAL_CAN_GetRxMessage(hcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
         return;
@@ -614,6 +676,12 @@ HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo1ITs) {
  */
 void
 HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferIndexes) {
+    /* Resolve instance from HAL handle - replaces former CANModule_local singleton */
+    CO_CANmodule_t* CANModule_local = prv_find_canmodule_by_handle(hfdcan);
+    if (CANModule_local == NULL) {
+        return;
+    }
+
     CANModule_local->firstCANtxMessage = false;            /* First CAN message (bootup) was sent successfully */
     CANModule_local->bufferInhibitFlag = false;            /* Clear flag from previous message */
     if (CANModule_local->CANtxCount > 0U) {                /* Are there any new messages waiting to be send */
@@ -644,7 +712,7 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
         CO_UNLOCK_CAN_SEND(CANModule_local);
     }
 }
-#else
+#else /* bxCAN */
 /**
  * \brief           Rx FIFO 0 callback.
  * \param[in]       hcan: pointer to an CAN_HandleTypeDef structure that contains

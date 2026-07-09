@@ -30,7 +30,8 @@ SOURCES = \
 	$(CANOPEN_SRC)/305/CO_LSSslave.c \
 	$(CANOPEN_SRC)/storage/CO_storage.c \
 	$(CANOPEN_SRC)/CANopen.c \
-	$(APPL_SRC)/OD.c \
+	$(APPL_SRC)/OD_can_node_1.c \
+	$(APPL_SRC)/OD_can_node_2.c \
 	$(DRV_SRC)/main_blank.c
 
 
